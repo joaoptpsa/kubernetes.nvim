@@ -163,6 +163,16 @@ local function patch_definitions_kind(definitions)
 	end
 end
 
+--- patches IntOrString to accept integers as well as strings. The cluster's
+--- OpenAPI v2 document types it as string only, which flags integer ports.
+---@param definitions table
+local function patch_definitions_intorstring(definitions)
+	local intorstring = definitions.definitions["io.k8s.apimachinery.pkg.util.intstr.IntOrString"]
+	if intorstring ~= nil and intorstring.type == "string" then
+		intorstring.type = { "string", "integer" }
+	end
+end
+
 --- patches the definitions to set the `additionalProperties` field to false if it is not present
 ---@param definitions table
 local function patch_definitions_strict(definitions)
@@ -193,6 +203,7 @@ local function schema_generate(opts, on_generate)
 	log.debug("starting schema generation")
 	kubectl_fetch_definitions(function(definitions)
 		patch_definitions_kind(definitions)
+		patch_definitions_intorstring(definitions)
 		if opts.schema_strict then
 			patch_definitions_strict(definitions)
 		end
