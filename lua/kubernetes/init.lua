@@ -277,17 +277,54 @@ function M.yamlls_schema()
 	return "file://" .. PATH_SCHEMA
 end
 
----@return table containing all valid kube filetypes
-function M.yamlls_filetypes()
-	local filetypes = {}
-	local kinds = kubectl_kinds()
-	for _, k in ipairs(kinds) do
+--- kinds (lowercased) found in the generated definitions cache, or nil if there is no readable cache
+---@return string[]?
+local function cached_kinds()
+	if vim.fn.filereadable(PATH_DEFINITIONS) ~= 1 then
+		return nil
+	end
+	local ok, decoded = pcall(vim.json.decode, table.concat(vim.fn.readfile(PATH_DEFINITIONS), "\n"))
+	if not ok or type(decoded) ~= "table" or type(decoded.definitions) ~= "table" then
+		return nil
+	end
+	local seen = {}
+	local kinds = {}
+	for _, definition in pairs(decoded.definitions) do
+		for _, gvk in ipairs(definition["x-kubernetes-group-version-kind"] or {}) do
+			local kind = gvk.kind:lower()
+			if not seen[kind] then
+				seen[kind] = true
+				kinds[#kinds + 1] = kind
+			end
+		end
+	end
+	table.sort(kinds)
+	return kinds
+end
+
+--- kinds (lowercased) from the cluster, via a blocking kubectl call
+---@return string[]
+local function kubectl_cluster_kinds()
+	local kinds = {}
+	for _, k in ipairs(kubectl_kinds()) do
 		-- Grab last column
 		local kind = k:gsub(".* (%w+)$", "%1"):lower()
 		if kind ~= "" then
-			table.insert(filetypes, "*." .. kind .. ".yml")
-			table.insert(filetypes, "*." .. kind .. ".yaml")
+			kinds[#kinds + 1] = kind
 		end
+	end
+	return kinds
+end
+
+--- Uses the generated schema cache so no cluster is needed; asks kubectl
+--- (blocking) only when there is no cache.
+---@return table containing all valid kube filetypes
+function M.yamlls_filetypes()
+	local filetypes = {}
+	local kinds = cached_kinds() or kubectl_cluster_kinds()
+	for _, kind in ipairs(kinds) do
+		table.insert(filetypes, "*." .. kind .. ".yml")
+		table.insert(filetypes, "*." .. kind .. ".yaml")
 	end
 	return filetypes
 end
