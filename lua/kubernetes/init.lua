@@ -3,7 +3,9 @@ local log = require("kubernetes.log")
 local PATH_DATA = vim.fn.stdpath("data") .. "/kubernetes.nvim/"
 local PATH_DEFINITIONS = PATH_DATA .. "definitions.json"
 local PATH_SCHEMA = PATH_DATA .. "schema.json"
-local YAMLLS_PATCH_PATTERN = "isKubernetes && err.message === this.MATCHES_MULTIPLE"
+-- matches both the old (`isKubernetes`) and the current
+-- (`suppressKubernetesMatchesMultiple`) guard variables used by yamlls
+local YAMLLS_PATCH_PATTERN = "([%w_]+) && err%.message === this%.MATCHES_MULTIPLE"
 local YAMLLS_PATH_REPLACEMENT = "err.message === this.MATCHES_MULTIPLE"
 
 ---@class Options
@@ -115,9 +117,20 @@ end
 ---@param opts Options
 ---@return string path yamlls validation js path
 local function yamlls_validation_js_path(opts)
-        local root = opts.yamlls_root()
-
-	return vim.fs.joinpath(root, "node_modules/yaml-language-server/out/server/src/languageservice/services/yamlValidation.js")
+	local root = opts.yamlls_root()
+	local paths = {
+		-- yamlls < 2.0.0
+		vim.fs.joinpath(root, "node_modules/yaml-language-server/out/server/src/languageservice/services/yamlValidation.js"),
+		-- yamlls >= 2.0.0
+		vim.fs.joinpath(root, "node_modules/yaml-language-server/out/src/languageservice/services/yamlValidation.js"),
+	}
+	for _, path in ipairs(paths) do
+		if vim.fn.filereadable(path) == 1 then
+			return path
+		end
+	end
+	-- report the missing legacy path so a broken yamlls install errors like before
+	return paths[1]
 end
 
 --- fetches the current cluster's schema using kubectl
@@ -138,38 +151,49 @@ local function kubectl_kinds()
 	return cmd_blocking({ "kubectl", "api-resources", "--no-headers" })
 end
 
---- patches the definitions to include an enum in the `kind` it exists
+--- adds `value` to the `enum` of a property, if it isn't already there
+---@param property table
+---@param value string
+local function add_enum_value(property, value)
+	property.enum = property.enum or {}
+	for _, v in ipairs(property.enum) do
+		if v == value then
+			return
+		end
+	end
+	property.enum[#property.enum + 1] = value
+end
+
+--- patches the definitions to include `kind` and `apiVersion` enums on
+--- top-level resources. these enums are derived from the
+--- `x-kubernetes-group-version-kind` extension, which is only present on
+--- resource definitions. nested types that also have a `kind` property (for
+--- example `ObjectReference`) are left untouched.
+--- the `apiVersion` enum also lets yamlls tell apart definitions of the same
+--- kind served under different group versions, like autoscaling/v1 and
+--- autoscaling/v2 HorizontalPodAutoscaler.
 ---@param definitions table
-local function patch_definitions_kind(definitions)
-	for key, resource in pairs(definitions.definitions) do
-		if resource.properties ~= nil and resource.properties.kind ~= nil then
-			local kind = resource.properties.kind
-			local parts = vim.split(key, ".", { plain = true })
-			local name = parts[#parts]
-			local insert = true
-			if kind.enum ~= nil then
-				for _, v in ipairs(kind.enum) do
-					if v == name then
-						insert = false
-						break
+local function patch_definitions_gvk(definitions)
+	for _, resource in pairs(definitions.definitions) do
+		local gvks = resource["x-kubernetes-group-version-kind"]
+		local properties = resource.properties
+		if gvks ~= nil and properties ~= nil then
+			for _, gvk in ipairs(gvks) do
+				-- "__internal" versions are not served by the api server
+				if gvk.version ~= nil and gvk.version ~= "__internal" then
+					if properties.kind ~= nil and gvk.kind ~= nil then
+						add_enum_value(properties.kind, gvk.kind)
+					end
+					if properties.apiVersion ~= nil then
+						local api_version = gvk.version
+						if gvk.group ~= nil and gvk.group ~= "" then
+							api_version = gvk.group .. "/" .. gvk.version
+						end
+						add_enum_value(properties.apiVersion, api_version)
 					end
 				end
 			end
-			if insert then
-				kind.enum = kind.enum or {}
-				kind.enum[#kind.enum + 1] = name
-			end
 		end
-	end
-end
-
---- patches IntOrString to accept integers as well as strings. The cluster's
---- OpenAPI v2 document types it as string only, which flags integer ports.
----@param definitions table
-local function patch_definitions_intorstring(definitions)
-	local intorstring = definitions.definitions["io.k8s.apimachinery.pkg.util.intstr.IntOrString"]
-	if intorstring ~= nil and intorstring.type == "string" then
-		intorstring.type = { "string", "integer" }
 	end
 end
 
@@ -193,6 +217,25 @@ local function generate_oneof_schema(definitions)
 	return { oneOf = oneOf }
 end
 
+--- patches definitions that kubernetes accepts as either a number or a string
+--- but that the openapi schema describes as plain strings. without this,
+--- yamlls rejects valid values like `targetPort: 9376` and `cpu: 1`.
+---@param definitions table
+local function patch_definitions_number_or_string(definitions)
+	for _, resource in pairs(definitions.definitions) do
+		-- ex: io.k8s.apimachinery.pkg.util.intstr.IntOrString
+		if resource.format == "int-or-string" then
+			resource.type = { "string", "integer" }
+			resource.format = nil
+		end
+	end
+	-- quantities accept numbers as well, ex: requests.cpu: 1
+	local quantity = definitions.definitions["io.k8s.apimachinery.pkg.api.resource.Quantity"]
+	if quantity ~= nil and quantity.type == "string" then
+		quantity.type = { "string", "number" }
+	end
+end
+
 local function schema_exists()
 	return vim.fn.filereadable(PATH_SCHEMA) and vim.fn.filereadable(PATH_DEFINITIONS)
 end
@@ -202,8 +245,8 @@ end
 local function schema_generate(opts, on_generate)
 	log.debug("starting schema generation")
 	kubectl_fetch_definitions(function(definitions)
-		patch_definitions_kind(definitions)
-		patch_definitions_intorstring(definitions)
+		patch_definitions_gvk(definitions)
+		patch_definitions_number_or_string(definitions)
 		if opts.schema_strict then
 			patch_definitions_strict(definitions)
 		end
